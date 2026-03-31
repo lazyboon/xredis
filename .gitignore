@@ -1,0 +1,13 @@
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Go
+bin/
+dist/
+coverage.out
+*.test
+

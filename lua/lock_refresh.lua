@@ -1,6 +1,7 @@
--- lock_refresh.lua: arguments => [value, ttl]
--- It refreshes lock key TTLs if all stored values match the provided value.
+-- ARGV: [stored value, TTL in milliseconds].
+-- Renew every key only if all stored values still match this lease.
 
+-- Check all keys before changing any TTL; metadata is part of the exact value comparison.
 local values = redis.call("mget", unpack(KEYS))
 for i, _ in ipairs(KEYS) do
   if values[i] ~= ARGV[1] then

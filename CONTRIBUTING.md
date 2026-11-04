@@ -1,42 +1,20 @@
 # Contributing
 
-Thanks for your interest in contributing to `xredis`.
+Discuss public API or storage-format changes before implementing them. Keep pull
+requests focused and explain the behavior being changed and how it was tested.
 
-## Development Setup
+Before submitting:
 
-1. Install Go (use the version required by `go.mod`).
-2. Clone the repository.
-3. Run:
-
-```bash
+```sh
+gofmt -w .
 go mod tidy
-go test ./...
+go vet ./...
+go test -race -shuffle=on -count=1 ./...
 ```
 
-## Pull Request Guidelines
+For real Redis integration checks, use an isolated server and the environment
+variable documented in [README.md](README.md); never use production data.
 
-1. Keep changes focused and small.
-2. Add/update tests for behavior changes.
-3. Update `README.md` for API-visible changes.
-4. Update `CHANGELOG.md` under `[Unreleased]`.
-5. Ensure CI passes.
-
-## Code Style
-
-- Run `gofmt -w` on modified files.
-- Use clear error messages with package context (`xredis: ...`).
-- Keep Lua script protocol changes backward-compatible where possible.
-
-## Commit Messages
-
-Recommended format:
-
-```text
-type(scope): short summary
-```
-
-Examples:
-
-- `feat(limiter): add multi-rule atomic checks`
-- `fix(lock): return ErrLockNotHeld on release mismatch`
-
+Add regression tests for fixes and runnable examples for new public APIs.
+Do not commit credentials, coverage output, or local editor settings. Contributions
+are provided under the repository's [MIT license](LICENSE).

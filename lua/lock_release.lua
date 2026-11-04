@@ -1,6 +1,7 @@
--- lock_release.lua: arguments => [value]
--- It releases lock keys only when all stored values match.
+-- ARGV: [stored value].
+-- Delete every key only if all stored values still match this lease.
 
+-- Check ownership across the entire lease before deleting any key.
 local values = redis.call("mget", unpack(KEYS))
 for i, _ in ipairs(KEYS) do
   if values[i] ~= ARGV[1] then

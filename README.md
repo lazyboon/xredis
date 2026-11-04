@@ -1,192 +1,151 @@
 # xredis
 
-`xredis` is a lightweight utility library built on top of `go-redis/v9`, with three core capabilities:
+Named [go-redis](https://github.com/redis/go-redis) clients, atomic Redis leases,
+and multi-rule rate limiting. Locks and limiters also accept caller-owned clients;
+the named-client registry is optional.
 
-- Redis client initialization and lifecycle management for multiple instances (`Init/Get/Close/CloseAll`)
-- Lua-based distributed locks (single-key and multi-key atomic lock)
-- Lua-based rate limiting (single-rule and multi-rule atomic checks, suitable for captcha throttling)
+Requires **Go 1.27.3+**. Integration tests cover Redis 6.2, 7.4, and 8.
 
-## Installation
-
-```bash
+```sh
 go get github.com/lazyboon/xredis
 ```
 
-## 1. Initialize and Retrieve Redis Clients
+## Clients
+
+Initialize clients during application startup, then reuse them. Configuration
+durations are in **seconds**. `ExtraOptions` accepts native TLS, credentials,
+connection hooks, and other go-redis settings.
 
 ```go
-package main
-
-import (
-	"log"
-
-	"github.com/lazyboon/xredis"
-)
-
-func ptrU(v uint) *uint { return &v }
-
-func main() {
-	err := xredis.Init([]*xredis.Config{
-		{
-			Alias:       "cache",
-			Addr:        "127.0.0.1:6379",
-			DB:          0,
-			PingTimeout: ptrU(3),
-		},
-		{
-			Alias: "queue",
-			Addr:  "127.0.0.1:6380",
-			DB:    1,
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer xredis.CloseAll()
-
-	cache := xredis.Get("cache")
-	if cache == nil {
-		log.Fatal("cache client not found")
-	}
-
-	_ = cache
-}
-```
-
-### Config Priority
-
-- Fields in `Config.ExtraOptions` have the highest priority.
-- Missing fields in `ExtraOptions` fall back to `Config` fields.
-- `PingTimeout` defaults to 10 seconds via `FillDefaults()`.
-
-## 2. Distributed Lock
-
-### Single-key Lock
-
-```go
-package main
-
-import (
-	"context"
-	"errors"
-	"log"
-	"time"
-
-	"github.com/lazyboon/xredis"
-)
-
-func main() {
-	ctx := context.Background()
-	rdb := xredis.Get("cache")
-	if rdb == nil {
-		log.Fatal("redis client not found")
-	}
-
-	lockMgr := xredis.NewLockManager(rdb)
-	lock, err := lockMgr.Obtain(ctx, "lock:order:123", 10*time.Second)
-	if err != nil {
-		if errors.Is(err, xredis.ErrNotObtained) {
-			log.Println("lock is contended")
-			return
-		}
-		log.Fatal(err)
-	}
-	defer func() {
-		_ = lock.Release(ctx)
-	}()
-
-	ttl, err := lock.TTL(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("lock ttl=%s token=%s", ttl, lock.Token())
-
-	if err = lock.Refresh(ctx, 10*time.Second); err != nil {
-		log.Fatal(err)
-	}
-}
-```
-
-### Multi-key Atomic Lock
-
-```go
-keys := []string{
-	"lock:wallet:user:1001",
-	"lock:inventory:sku:888",
-}
-
-lock, err := lockMgr.ObtainMulti(ctx, keys, 8*time.Second)
+options, err := redis.ParseURL(os.Getenv("REDIS_URL"))
 if err != nil {
-	// If any key is contended, the whole acquire fails (all-or-nothing).
-	return
+    return err
 }
-defer lock.Release(ctx)
+if err := xredis.InitContext(ctx, []*xredis.Config{
+    {Alias: "main", ExtraOptions: options},
+}); err != nil {
+    return err
+}
+client := xredis.Get("main")
 ```
 
-## 3. Rate Limiting
+Use imports `github.com/lazyboon/xredis` and
+`github.com/redis/go-redis/v9`. Stop consumers before `Close("main")` or
+`CloseAll()`, and handle their returned errors. The registry owns registered
+clients; consumers must not close the shared client directly.
 
-### 3.1 Single-rule Rate Limit
+- Initialization prepares the complete batch before registration; failure closes
+  the clients prepared by that call and leaves the registry unchanged.
+- `InitContext` bounds context-aware startup work. Custom dialers and connection
+  hooks must honor their context; the library cannot interrupt arbitrary callbacks.
+  Canceling that context after success does not
+  shut down the running clients. Do not overlap startup with registry shutdown.
+- Unset pointer fields preserve native defaults. `PingTimeout` defaults to ten
+  seconds and cannot be zero. Native nonzero overlapping values take precedence.
+- `ExtraOptions.DB == 0` falls back to `Config.DB`. To select Redis database zero,
+  set `Config.DB` to zero as well.
+- Native `ReadTimeout`/`WriteTimeout == -2` retain their normal no-deadline
+  behavior. In that case, startup uses and closes a separate probe pool, and the
+  runtime client connects on demand. Native connection hooks run for every
+  physical connection, including probe connections.
+
+## Leases
 
 ```go
-limiter := xredis.NewLimiter(rdb)
-
-// 5 requests per minute, burst defaults to rate (5).
-limit := xredis.NewPerMinuteLimit(5)
-res, err := limiter.Allow(ctx, "api:send_code:user:1001", limit)
+locks := xredis.NewLockManager(client)
+lease, err := locks.Obtain(ctx, "jobs:{123}:lock", 30*time.Second)
+if errors.Is(err, xredis.ErrNotObtained) {
+    // Another owner holds the lease.
+    return err
+}
 if err != nil {
-	return err
+    return err
 }
-if res.Allowed == 0 {
-	// Rate-limited, wait for res.RetryAfter.
-	return nil
-}
+// Finish protected work before expiry, or explicitly renew with lease.Refresh.
+return lease.Release(ctx)
 ```
 
-### 3.2 Multi-rule Atomic Rate Limit (Recommended for Captcha)
+Use `ObtainMulti` for all-or-nothing acquisition of multiple keys. Keys must be
+unique and share one hash slot in Redis Cluster. TTLs must be at least one
+millisecond; fractional milliseconds are truncated.
 
-All rules are checked in one script call, and state is updated only if all rules pass.
+Ownership is checked by every operation. Tokens may contain colons and binary
+bytes. Omitted tokens are generated independently; use different tokens for
+independent executions. An explicit same-token retry can renew the lease and
+replace its metadata. After changing metadata, operate through the newly returned
+`Lock`; the old handle no longer matches.
+
+**Leases do not renew automatically.** Context cancellation does not release an
+acquired lease or stop work that has already started. Lease expiry alone cannot
+prevent an expired holder from continuing to modify an external resource.
+
+By default acquisition makes one attempt. `WithLockRetryStrategy` enables
+contention retries. Supply a caller deadline to bound waiting; without one,
+explicit retries have an acquisition window equal to the requested lease TTL.
+Non-contention Redis failures are not retried by this layer. An absent lease
+returns `ErrLockNotHeld` from `Release`/`Refresh`, and a zero TTL from `TTL`.
+
+## Rate limits
 
 ```go
-rules := []xredis.Rule{
-	// 1 request per minute
-	{Key: "captcha:send:user:1001:1m", Limit: xredis.NewPerMinuteLimit(1)},
-	// 5 requests per hour
-	{Key: "captcha:send:user:1001:1h", Limit: xredis.NewPerHourLimit(5)},
-	// 20 requests per day
-	{Key: "captcha:send:user:1001:1d", Limit: xredis.NewPerDayLimit(20)},
-}
-
-res, err := limiter.AllowNRules(ctx, rules, 1)
+limiter := xredis.NewLimiter(client)
+result, err := limiter.Allow(ctx, "api:{123}:minute", xredis.NewPerMinuteLimit(120, 10))
 if err != nil {
-	return err
+    return err
 }
-if res.Allowed == 0 {
-	// Which rule blocked this request:
-	// res.LimitedBy.Index: index in rules
-	// res.LimitedBy.Key:   key of that rule
-	// res.RetryAfter:      suggested wait duration before retry
-	return nil
+if result.Allowed == 0 {
+    // Denial is a normal result. RetryAfter is the delay before another attempt.
 }
 ```
 
-### AllowNRules vs AllowAtMostRules
+`AllowN` admits the complete cost or none. `AllowAtMost` admits a partial cost.
+`AllowNRules` and `AllowAtMostRules` apply multiple rules atomically; a denied
+full-cost request consumes no quota from any rule. `LimitedBy` identifies the
+constraining rule. `Reset` deletes the selected quota state.
 
-- `AllowNRules(ctx, rules, n)`: allows exactly `n` or `0`.
-- `AllowAtMostRules(ctx, rules, n)`: allows a value in `[0, n]` (best-effort admission).
+Rules using the same key share state. Reset the key, or choose a new one, when
+changing a rule. The package does not add key prefixes. Multi-key operations
+require a shared Cluster hash slot. A period is truncated to microseconds, and
+the replenishment interval must be at least one microsecond. Invalid parameters
+return `ErrInvalidInput`; malformed script replies return `ErrScriptProtocol`.
+Quota state expires automatically using Redis server time.
 
-## 4. Common Errors
+The package does not own caller-provided clients. Timeouts, authentication, TLS,
+primary routing, and client-level retry settings remain the caller's responsibility.
+Lua isolates operations; a transport failure can leave a write's outcome unknown.
 
-- `xredis.ErrNotObtained`: lock acquisition failed due to contention.
-- `xredis.ErrLockNotHeld`: lock refresh/release called when lock is no longer owned.
-- `xredis.ErrInvalidInput`: invalid limiter input (empty key, empty rules, `n <= 0`, etc).
-- `xredis.ErrScriptProtocol`: unexpected Lua result protocol.
+## Testing
 
-## 5. Release Notes for This Repository
+```sh
+go test -race -shuffle=on -count=1 ./...
+go vet ./...
+```
 
-Before tagging a release, verify:
+Default tests use local in-memory protocol fixtures and do not require Redis.
+The integration suite executes the real Lua scripts. It only uses randomly
+namespaced keys and never flushes a database:
 
-1. Go version strategy: current `go.mod` is `go 1.25`; make sure local and CI environments can install/use it.
-2. Test coverage: add integration tests for lock and limiter critical paths.
-3. Changelog: add a `CHANGELOG.md` with API and behavior notes.
-4. Versioning: use clear semver tags (`v0.x` for fast iteration or `v1.0.0` for stable API).
+```sh
+XREDIS_REDIS_URL=redis://127.0.0.1:6379/0 \
+  go test -race -shuffle=on -count=1 -tags integration ./...
+```
 
+Use an isolated test server. URLs support authentication and a database number.
+Without `XREDIS_REDIS_URL`, integration tests skip rather than guessing an address.
+CI runs them against Redis 6.2, 7.4, and 8.
+
+## Migrating from earlier v1 releases
+
+This update stays on the v1 module path while changing several APIs. Review the
+pointer-valued optional configuration fields and error-returning shutdown methods.
+Custom lock and limiter client interfaces use the `I` prefix.
+
+Lock values now use a byte-length-prefixed owner format. Allow old leases to
+expire, release them before upgrading, or use a new key namespace; do not mix
+old and new lease owners on the same keys. Same-token retries remain intentional.
+Rate-limiter precision and duration validation reject previously accepted unsafe
+inputs. Native options and startup timeout behavior are described above.
+
+## License
+
+[MIT](LICENSE).

@@ -1,20 +1,17 @@
--- rate_allow_multi_n.lua:
--- ARGV => [burst_1, rate_1, period_us_1, burst_2, rate_2, period_us_2, ..., cost]
--- KEYS => [rate_limit_key_1, rate_limit_key_2, ...]
+-- ARGV: [burst, rate, period in microseconds for each rule, then request cost].
+-- KEYS: one state key per rule, in the same order as ARGV.
 --
--- Atomic multi-limit check for AllowN semantics:
--- 1) Check every limit first.
--- 2) If any limit rejects, do not update any key.
--- 3) If all pass, update all keys.
--- return => [allowed, remaining, retry_after, reset_after, limited_by_index]
--- limited_by_index is 1-based, -1 means no specific limiter.
--- remaining is the post-update remaining allowance after applying allowed.
--- retry_after is -1 when allowed > 0, otherwise it is the wait time for this requested cost.
--- reset_after is the duration until the limiting state is fully drained/reset.
+-- AllowN checks every rule before writing state; a denial consumes no quota.
+-- Each key stores the theoretical arrival time (TAT) as Unix microseconds.
+-- Result: [allowed cost, remaining quota, retry delay in microseconds,
+--          recovery duration in microseconds, constraining rule index].
+-- Rule indices are one-based; -1 means no rule constrained admission.
+-- Retry delay is -1 on admission, or the wait for the full requested cost on denial.
 
 local key_count = #KEYS
 local cost = tonumber(ARGV[key_count * 3 + 1])
 
+-- Use one server timestamp so every rule evaluates the same instant.
 local now = redis.call("TIME")
 local now_us = now[1] * 1000000 + now[2]
 
@@ -26,6 +23,7 @@ local deny_reset_after = 0
 local deny_limited_index = -1
 local denied = false
 
+-- Calculate each rule's virtual schedule without consuming quota yet.
 for i = 1, key_count do
   local arg_base = 1 + (i - 1) * 3
   local burst = tonumber(ARGV[arg_base])
@@ -76,6 +74,7 @@ if denied then
   return {0, 0, math.ceil(deny_retry_after), math.ceil(deny_reset_after), deny_limited_index}
 end
 
+-- Only admitted requests advance state. Round expiration up to avoid early quota recovery.
 for i = 1, key_count do
   local reset_after = new_tats[i] - now_us
   if reset_after > 0 then

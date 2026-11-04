@@ -1,5 +1,6 @@
--- lock_pttl.lua: arguments => [value]
--- It returns the minimum positive TTL if all values match, otherwise false.
+-- ARGV: [stored value].
+-- Return the shortest positive TTL when all values match, or false on an ownership mismatch.
+-- Return 0 if no matching key has a positive TTL.
 
 local values = redis.call("mget", unpack(KEYS))
 for i, _ in ipairs(KEYS) do

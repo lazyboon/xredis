@@ -1,6 +1,6 @@
 module github.com/lazyboon/xredis
 
-go 1.21
+go 1.27.3
 
 require (
 	github.com/google/uuid v1.6.0
@@ -11,5 +11,8 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )

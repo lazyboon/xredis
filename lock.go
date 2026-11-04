@@ -4,6 +4,9 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,23 +14,25 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type RedisClient interface {
+// IRedisClient is the script execution contract required by distributed locks.
+type IRedisClient interface {
 	redis.Scripter
 }
 
 var (
-	// ErrNotObtained indicates that a lock attempt failed because key(s) are already held.
+	// ErrNotObtained indicates that another token holds at least one requested key.
 	ErrNotObtained = errors.New("xredis: lock not obtained")
 
-	// ErrLockNotHeld indicates that the lock is not currently held by the caller.
+	// ErrLockNotHeld indicates that the lock is absent or no longer matches the caller's value.
 	ErrLockNotHeld = errors.New("xredis: lock not held")
 
-	// Internal lock validation / protocol errors.
-	errEmptyLockKeys  = errors.New("xredis: lock keys cannot be empty")
-	errEmptyLockKey   = errors.New("xredis: lock key cannot be empty")
-	errInvalidTTL     = errors.New("xredis: lock ttl must be greater than zero")
-	errNilLockManager = errors.New("xredis: lock manager is nil")
-	errNilRedisClient = errors.New("xredis: redis client is nil")
+	// Internal errors distinguish invalid arguments from unavailable dependencies.
+	errEmptyLockKeys    = errors.New("xredis: lock keys cannot be empty")
+	errEmptyLockKey     = errors.New("xredis: lock key cannot be empty")
+	errDuplicateLockKey = errors.New("xredis: lock keys must be unique")
+	errInvalidTTL       = errors.New("xredis: lock ttl must be at least one millisecond")
+	errNilLockManager   = errors.New("xredis: lock manager is nil")
+	errNilRedisClient   = errors.New("xredis: redis client is nil")
 )
 
 //go:embed lua/lock_obtain.lua
@@ -49,24 +54,26 @@ var (
 	pttlScript    = redis.NewScript(pttlLua)
 )
 
+// LockOption configures an acquisition attempt.
 type LockOption func(*LockOptions)
 
-// LockOptions configures lock obtain behavior.
+// LockOptions defines token, metadata, and retry settings for acquisition.
 type LockOptions struct {
-	// Token identifies the lock owner. If nil/empty, a random UUID token is used.
+	// Token identifies the owner. Nil or empty values generate a UUID.
+	// Independent executions must use different tokens.
 	Token *string
-	// Metadata is appended to the token and stored as lock value.
+	// Metadata follows the ownership prefix and is ignored when retrying with the same token.
 	Metadata *string
-	// RetryStrategy controls retries when lock is contended. Default: no retry.
+	// RetryStrategy controls retries on contention. Nil disables application-level retries.
 	RetryStrategy xretry.Strategy
 }
 
-// NewLockOption returns a lock option container with defaults.
+// NewLockOption returns an empty option container with default acquisition behavior.
 func NewLockOption() *LockOptions {
 	return &LockOptions{}
 }
 
-// Apply applies functional options to the receiver and returns it.
+// Apply applies non-nil options in order and returns the receiver.
 func (o *LockOptions) Apply(options ...LockOption) *LockOptions {
 	for _, option := range options {
 		if option != nil {
@@ -76,50 +83,56 @@ func (o *LockOptions) Apply(options ...LockOption) *LockOptions {
 	return o
 }
 
-// WithLockToken sets a custom lock token.
+// WithLockToken sets the ownership token; an empty token requests an automatically generated UUID.
 func WithLockToken(token string) LockOption {
 	return func(opts *LockOptions) {
 		opts.Token = &token
 	}
 }
 
-// WithLockMetadata sets lock metadata appended to the token.
+// WithLockMetadata attaches metadata to the stored lock value.
+// After a same-token retry changes metadata, refresh and release through the newly returned Lock.
 func WithLockMetadata(metadata string) LockOption {
 	return func(opts *LockOptions) {
 		opts.Metadata = &metadata
 	}
 }
 
-// WithLockRetryStrategy sets the retry strategy used by Obtain/ObtainMulti.
+// WithLockRetryStrategy sets the retry policy for contention.
+// Without a caller deadline, an explicitly configured policy receives an acquisition window of one TTL.
 func WithLockRetryStrategy(strategy xretry.Strategy) LockOption {
 	return func(opts *LockOptions) {
 		opts.RetryStrategy = strategy
 	}
 }
 
-// LockManager wraps a redis client and provides distributed lock operations.
+// LockManager manages expiring Redis leases using atomic scripts.
+// It can be shared if its client supports concurrent use. The caller retains client ownership.
+// Stored values use a length-prefixed format; release or expire legacy locks before mixing versions.
 type LockManager struct {
-	client RedisClient
+	client IRedisClient
 }
 
-// NewLockManager creates a lock manager for the provided redis client.
-func NewLockManager(c RedisClient) *LockManager {
+// NewLockManager creates a manager without acquiring a lock or opening a connection.
+func NewLockManager(c IRedisClient) *LockManager {
 	return &LockManager{client: c}
 }
 
-// Obtain tries to acquire a single-key lock.
-// It returns ErrNotObtained when the lock cannot be acquired.
+// Obtain acquires a single-key lease or returns [ErrNotObtained] on contention.
 func (m *LockManager) Obtain(ctx context.Context, key string, ttl time.Duration, options ...LockOption) (*Lock, error) {
 	return m.ObtainMulti(ctx, []string{key}, ttl, options...)
 }
 
-// ObtainMulti tries to acquire an atomic multi-key lock.
-// If any key is contended, no lock is acquired and ErrNotObtained is returned.
+// ObtainMulti acquires all requested keys atomically or returns [ErrNotObtained] on contention.
+// A retry with the same token may replace metadata and renew all keys.
+// Keys must be nonempty and unique; in Redis Cluster they must share a hash slot.
+// ttl must be at least one millisecond and is rounded down to whole milliseconds.
+// Leases are not renewed automatically, and cancellation does not release an acquired lease.
 func (m *LockManager) ObtainMulti(ctx context.Context, keys []string, ttl time.Duration, options ...LockOption) (*Lock, error) {
 	if m == nil {
 		return nil, errNilLockManager
 	}
-	if m.client == nil {
+	if nilClient(m.client) {
 		return nil, errNilRedisClient
 	}
 
@@ -129,16 +142,18 @@ func (m *LockManager) ObtainMulti(ctx context.Context, keys []string, ttl time.D
 
 	opts := NewLockOption().Apply(options...)
 	token := m.resolveToken(opts.Token)
-	value := token
+	// Include the token's byte length so shorter tokens cannot match a longer owner's prefix.
+	// Byte offsets match Redis GETRANGE and Lua string operations, including binary tokens.
+	owner := strconv.Itoa(len(token)) + ":" + token
+	value := owner
 	if opts.Metadata != nil {
-		value = token + *opts.Metadata
+		value += *opts.Metadata
 	}
 
 	runCtx := ctx
 	cancel := func() {}
-	// Keep retry bounded: when caller does not set a deadline,
-	// cap attempts to at most one TTL window.
-	if _, ok := ctx.Deadline(); !ok {
+	// Bound explicit retries only; a single attempt uses the caller's context unchanged.
+	if _, ok := ctx.Deadline(); !ok && opts.RetryStrategy != nil {
 		runCtx, cancel = context.WithDeadline(ctx, time.Now().Add(ttl))
 	}
 	defer cancel()
@@ -147,7 +162,7 @@ func (m *LockManager) ObtainMulti(ctx context.Context, keys []string, ttl time.D
 		runCtx,
 		m.resolveRetryStrategy(opts),
 		func(attemptCtx context.Context) error {
-			return m.obtainOnce(attemptCtx, keys, value, len(token), ttl)
+			return m.obtainOnce(attemptCtx, keys, value, len(owner), ttl)
 		},
 		xretry.WithShouldRetry(func(_ context.Context, _ int, err error) bool {
 			return errors.Is(err, ErrNotObtained)
@@ -157,24 +172,31 @@ func (m *LockManager) ObtainMulti(ctx context.Context, keys []string, ttl time.D
 		return nil, m.unwrapRetryError(err)
 	}
 
-	return m.newLock(keys, value, len(token), ttl), nil
+	return m.newLock(keys, value, len(owner)), nil
 }
 
+// validateObtainArgs rejects empty or duplicate keys and sub-millisecond TTLs before script execution.
 func (m *LockManager) validateObtainArgs(keys []string, ttl time.Duration) error {
 	if len(keys) == 0 {
 		return errEmptyLockKeys
 	}
+	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		if key == "" {
 			return errEmptyLockKey
 		}
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("%w: %q", errDuplicateLockKey, key)
+		}
+		seen[key] = struct{}{}
 	}
-	if ttl <= 0 {
+	if ttl < time.Millisecond {
 		return errInvalidTTL
 	}
 	return nil
 }
 
+// resolveToken generates an independent owner identifier when no token is supplied.
 func (m *LockManager) resolveToken(token *string) string {
 	if token != nil && *token != "" {
 		return *token
@@ -182,6 +204,7 @@ func (m *LockManager) resolveToken(token *string) string {
 	return uuid.NewString()
 }
 
+// resolveRetryStrategy falls back to a single attempt when retries are not configured.
 func (m *LockManager) resolveRetryStrategy(opts *LockOptions) xretry.Strategy {
 	if opts.RetryStrategy != nil {
 		return opts.RetryStrategy
@@ -189,8 +212,9 @@ func (m *LockManager) resolveRetryStrategy(opts *LockOptions) xretry.Strategy {
 	return xretry.NewZero()
 }
 
-func (m *LockManager) obtainOnce(ctx context.Context, keys []string, value string, tokenLen int, ttl time.Duration) error {
-	_, err := obtainScript.Run(ctx, m.client, keys, value, tokenLen, ttl.Milliseconds()).Result()
+// obtainOnce maps a script ownership rejection to [ErrNotObtained].
+func (m *LockManager) obtainOnce(ctx context.Context, keys []string, value string, ownerLen int, ttl time.Duration) error {
+	_, err := obtainScript.Run(ctx, m.client, keys, value, ownerLen, ttl.Milliseconds()).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return ErrNotObtained
@@ -200,40 +224,39 @@ func (m *LockManager) obtainOnce(ctx context.Context, keys []string, value strin
 	return nil
 }
 
+// unwrapRetryError exposes the final attempt error without requiring callers to inspect xretry types.
 func (m *LockManager) unwrapRetryError(err error) error {
 	var retryErr *xretry.RetryError
-	// Collapse xretry wrapper to the concrete last error for cleaner API behavior.
 	if errors.As(err, &retryErr) && retryErr.Last() != nil {
 		return retryErr.Last()
 	}
 	return err
 }
 
-func (m *LockManager) newLock(keys []string, value string, tokenLen int, ttl time.Duration) *Lock {
+// newLock snapshots the key list so caller mutations cannot change the lease's ownership scope.
+func (m *LockManager) newLock(keys []string, value string, ownerLen int) *Lock {
 	keysCopy := make([]string, len(keys))
 	copy(keysCopy, keys)
 	return &Lock{
-		LockManager: m,
-		keys:        keysCopy,
-		value:       value,
-		tokenLen:    tokenLen,
-		ttl:         ttl,
+		client:   m.client,
+		keys:     keysCopy,
+		value:    value,
+		ownerLen: ownerLen,
 	}
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-
+// Lock identifies an acquired lease. Expiration or a changed stored value can invalidate it.
+// Operations compare ownership in Redis; possession of a Lock alone does not prove current ownership.
 type Lock struct {
-	*LockManager
-	keys []string
-	// value is the exact payload stored in Redis (token + metadata).
+	client IRedisClient
+	keys   []string
+	// value is len(token) + ":" + token + metadata; the length header and token identify the owner.
 	value string
-	// tokenLen allows splitting token/metadata without storing them twice.
-	tokenLen int
-	ttl      time.Duration
+	// ownerLen separates the ownership prefix from metadata, using byte offsets.
+	ownerLen int
 }
 
-// Key returns the first lock key.
+// Key returns the first key, or an empty string for a nil or empty Lock.
 func (l *Lock) Key() string {
 	if l == nil {
 		return ""
@@ -244,7 +267,7 @@ func (l *Lock) Key() string {
 	return l.keys[0]
 }
 
-// Keys returns a copy of all lock keys.
+// Keys returns a copy of the key list so callers cannot modify the lease's scope.
 func (l *Lock) Keys() []string {
 	if l == nil {
 		return nil
@@ -254,29 +277,35 @@ func (l *Lock) Keys() []string {
 	return keysCopy
 }
 
-// Token returns the lock token prefix from the stored lock value.
+// Token returns the original owner token without its storage length header.
 func (l *Lock) Token() string {
 	if l == nil {
 		return ""
 	}
-	if l.tokenLen <= 0 || l.tokenLen > len(l.value) {
+	if l.ownerLen <= 0 || l.ownerLen > len(l.value) {
 		return ""
 	}
-	return l.value[:l.tokenLen]
+	owner := l.value[:l.ownerLen]
+	separator := strings.IndexByte(owner, ':')
+	if separator < 0 {
+		return ""
+	}
+	return owner[separator+1:]
 }
 
-// Metadata returns the metadata suffix from the stored lock value.
+// Metadata returns the metadata attached when this Lock was acquired.
 func (l *Lock) Metadata() string {
 	if l == nil {
 		return ""
 	}
-	if l.tokenLen <= 0 || l.tokenLen > len(l.value) {
+	if l.ownerLen <= 0 || l.ownerLen > len(l.value) {
 		return ""
 	}
-	return l.value[l.tokenLen:]
+	return l.value[l.ownerLen:]
 }
 
-// Value returns the exact value stored in Redis for this lock.
+// Value returns the complete Redis value, including its length header.
+// Use [Lock.Token] and [Lock.Metadata] to retrieve the original components.
 func (l *Lock) Value() string {
 	if l == nil {
 		return ""
@@ -284,31 +313,30 @@ func (l *Lock) Value() string {
 	return l.value
 }
 
-// Refresh extends the lock TTL for all keys.
-// It returns ErrNotObtained if the lock is no longer held.
+// Refresh renews all keys if their values still match, otherwise returning [ErrLockNotHeld].
+// ttl must be at least one millisecond and is rounded down to whole milliseconds.
 func (l *Lock) Refresh(ctx context.Context, ttl time.Duration) error {
-	if l == nil {
-		return ErrNotObtained
+	if l == nil || nilClient(l.client) || len(l.keys) == 0 {
+		return ErrLockNotHeld
 	}
-	if ttl <= 0 {
+	if ttl < time.Millisecond {
 		return errInvalidTTL
 	}
 
 	_, err := refreshScript.Run(ctx, l.client, l.keys, l.value, ttl.Milliseconds()).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return ErrNotObtained
+			return ErrLockNotHeld
 		}
 		return err
 	}
-	l.ttl = ttl
 	return nil
 }
 
-// Release deletes lock keys if the stored lock value still matches.
-// It returns ErrLockNotHeld if the lock is no longer active.
+// Release deletes all keys only if their values still match this Lock.
+// An absent or changed value returns [ErrLockNotHeld].
 func (l *Lock) Release(ctx context.Context) error {
-	if l == nil {
+	if l == nil || nilClient(l.client) || len(l.keys) == 0 {
 		return ErrLockNotHeld
 	}
 	_, err := releaseScript.Run(ctx, l.client, l.keys, l.value).Result()
@@ -321,10 +349,10 @@ func (l *Lock) Release(ctx context.Context) error {
 	return nil
 }
 
-// TTL returns the remaining lock TTL.
-// For multi-key locks, the minimum TTL across keys is returned.
+// TTL returns the shortest positive TTL among matching keys.
+// An absent or changed value returns zero with no error; a nil or empty Lock returns [ErrLockNotHeld].
 func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
-	if l == nil {
+	if l == nil || nilClient(l.client) || len(l.keys) == 0 {
 		return 0, ErrLockNotHeld
 	}
 	ttl, err := pttlScript.Run(ctx, l.client, l.keys, l.value).Int64()

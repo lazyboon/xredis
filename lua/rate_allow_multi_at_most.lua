@@ -1,20 +1,17 @@
--- rate_allow_multi_at_most.lua:
--- ARGV => [burst_1, rate_1, period_us_1, burst_2, rate_2, period_us_2, ..., cost]
--- KEYS => [rate_limit_key_1, rate_limit_key_2, ...]
+-- ARGV: [burst, rate, period in microseconds for each rule, then request cost].
+-- KEYS: one state key per rule, in the same order as ARGV.
 --
--- Atomic multi-limit check for AllowAtMost semantics:
--- 1) Compute max allowed cost for every limit.
--- 2) If any limit allows 0, reject without updating any key.
--- 3) Otherwise use the minimum allowed cost and update all keys.
--- return => [allowed, remaining, retry_after, reset_after, limited_by_index]
--- limited_by_index is 1-based, -1 means no specific limiter.
--- retry_after (when allowed=0) means time until at least 1 unit is allowed.
--- reset_after means time until the limiting state is fully drained/reset.
--- remaining is the post-update remaining allowance after applying allowed.
+-- AllowAtMost chooses the largest cost every rule permits, up to the requested cost.
+-- A denial consumes no quota. Each key stores the theoretical arrival time (TAT) as Unix microseconds.
+-- Result: [allowed cost, remaining quota, retry delay in microseconds,
+--          recovery duration in microseconds, constraining rule index].
+-- Rule indices are one-based; -1 means no rule constrained admission.
+-- On denial, retry delay is the wait until at least one request can be admitted.
 
 local key_count = #KEYS
 local requested_cost = tonumber(ARGV[key_count * 3 + 1])
 
+-- Use one server timestamp so every rule evaluates the same instant.
 local now = redis.call("TIME")
 local now_us = now[1] * 1000000 + now[2]
 
@@ -27,6 +24,7 @@ local deny_reset_after = 0
 local deny_limited_index = -1
 local partial_limited_index = -1
 
+-- Determine the common admissible cost before writing any rule's state.
 for i = 1, key_count do
   local arg_base = 1 + (i - 1) * 3
   local burst = tonumber(ARGV[arg_base])
@@ -81,6 +79,7 @@ end
 local min_remaining = nil
 local max_reset_after = 0
 
+-- Apply the same admitted cost to every rule and retain state until its recovery time.
 for i = 1, key_count do
   local new_tat = tats[i] + emission_intervals[i] * allowed_cost
   local allow_at = new_tat - burst_offsets[i]
